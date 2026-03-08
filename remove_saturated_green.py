@@ -104,8 +104,9 @@ def erode(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
 
 
 def clean_binary_mask(mask: np.ndarray) -> np.ndarray:
-    closed = erode(dilate(mask, 1), 1)
-    return mask | closed
+    opened = dilate(erode(mask, 1), 1)
+    closed = erode(dilate(opened, 1), 1)
+    return closed
 
 
 def blur_mask(mask: np.ndarray, passes: int = 2) -> np.ndarray:
@@ -133,7 +134,7 @@ def detect_saturated_pixels(
     hue: np.ndarray, sat: np.ndarray, value: np.ndarray, alpha: np.ndarray
 ) -> tuple[np.ndarray, dict[str, float]]:
     valid = alpha > 0
-    analyzable = valid & (value > 0.10)
+    analyzable = valid & (value > 0.09)
     if not np.any(analyzable):
         raise RuntimeError("No visible pixels were found in hair.png.")
 
@@ -149,13 +150,14 @@ def detect_saturated_pixels(
     sat_peak_index = sat_floor_index + int(np.argmax(sat_histogram[sat_floor_index:]))
     sat_peak = float((sat_edges[sat_peak_index] + sat_edges[sat_peak_index + 1]) * 0.5)
 
-    local_saturation = analyzable & (np.abs(sat - sat_peak) <= 0.14)
+    local_saturation = analyzable & (np.abs(sat - sat_peak) <= 0.154)
     if np.count_nonzero(local_saturation) < 250:
-        local_saturation = analyzable & (np.abs(sat - sat_peak) <= 0.22)
+        local_saturation = analyzable & (np.abs(sat - sat_peak) <= 0.242)
 
-    sat_min = float(np.clip(np.percentile(sat[local_saturation], 12) - 0.03, 0.25, 0.95))
+    strict_sat_min = float(np.clip(np.percentile(sat[local_saturation], 12) - 0.033, 0.225, 0.95))
+    sat_min = float(max(0.0, strict_sat_min * 0.81))
     high_sat_mask = analyzable & (sat >= sat_min)
-    return high_sat_mask, {"sat_peak": sat_peak, "sat_min": sat_min}
+    return high_sat_mask, {"sat_peak": sat_peak, "sat_min": sat_min, "strict_sat_min": strict_sat_min}
 
 
 def detect_green_cluster(
@@ -185,19 +187,19 @@ def detect_green_cluster(
     peak_hue = float((hue_edges[peak_hue_idx] + hue_edges[peak_hue_idx + 1]) * 0.5)
     peak_sat = float((sat_edges[peak_sat_idx] + sat_edges[peak_sat_idx + 1]) * 0.5)
 
-    local_cluster = high_sat_mask & (circular_distance_deg(hue, peak_hue) <= 14.0) & (
-        np.abs(sat - peak_sat) <= 0.16
+    local_cluster = high_sat_mask & (circular_distance_deg(hue, peak_hue) <= 15.4) & (
+        np.abs(sat - peak_sat) <= 0.176
     )
     if np.count_nonzero(local_cluster) < 250:
-        local_cluster = high_sat_mask & (circular_distance_deg(hue, peak_hue) <= 22.0) & (
-            np.abs(sat - peak_sat) <= 0.24
+        local_cluster = high_sat_mask & (circular_distance_deg(hue, peak_hue) <= 24.2) & (
+            np.abs(sat - peak_sat) <= 0.264
         )
 
     hue_center = circular_mean_deg(hue[local_cluster])
     hue_width = float(
-        np.clip(np.percentile(circular_distance_deg(hue[local_cluster], hue_center), 98) + 4.0, 10.0, 42.0)
+        np.clip(np.percentile(circular_distance_deg(hue[local_cluster], hue_center), 98) + 4.4, 9.0, 46.0)
     )
-    sat_min = float(np.clip(np.percentile(sat[local_cluster], 8) - 0.04, 0.28, 0.95))
+    sat_min = float(np.clip(np.percentile(sat[local_cluster], 8) - 0.044, 0.25, 0.95))
     green_margin = value[local_cluster]
 
     return {
@@ -206,19 +208,7 @@ def detect_green_cluster(
         "hue_center": hue_center,
         "hue_width": hue_width,
         "sat_min": sat_min,
-        "value_min": float(np.clip(np.percentile(green_margin, 2) - 0.08, 0.05, 0.95)),
-    }
-
-
-def derive_aggressive_thresholds(cluster: dict[str, float]) -> dict[str, float]:
-    hard_value_min = float(np.clip(cluster["value_min"] - 0.60, 0.01, 0.55))
-    hard_hue_width = float(np.clip(cluster["hue_width"] + 22.0, 22.0, 65.0))
-
-    return {
-        "hard_value_min": hard_value_min,
-        "hard_hue_width": hard_hue_width,
-        "soft_value_min": float(max(0.0, hard_value_min - 0.08)),
-        "soft_hue_width": float(min(82.0, hard_hue_width + 14.0)),
+        "value_min": float(np.clip(np.percentile(green_margin, 2) - 0.088, 0.04, 0.95)),
     }
 
 
@@ -228,26 +218,45 @@ def build_masks(
     sat: np.ndarray,
     value: np.ndarray,
     alpha: np.ndarray,
+    high_sat_mask: np.ndarray,
     cluster: dict[str, float],
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    r = rgb[..., 0].astype(np.float32) / 255.0
+    g = rgb[..., 1].astype(np.float32) / 255.0
+    b = rgb[..., 2].astype(np.float32) / 255.0
+    max_rb = np.maximum(r, b)
     hue_distance = circular_distance_deg(hue, cluster["hue_center"])
     valid = alpha > 0
-    thresholds = derive_aggressive_thresholds(cluster)
+    thresholds = {
+        "hard_sat_min": float(max(0.0, cluster["sat_min"] * 0.81)),
+        "hard_value_min": float(max(0.0, cluster["value_min"] * 0.81)),
+        "hard_hue_width": float(min(46.2, cluster["hue_width"] * 1.21)),
+        "soft_sat_min": float(max(0.05, cluster["sat_min"] * 0.738)),
+        "soft_value_min": float(max(0.02, cluster["value_min"] * 0.756)),
+        "soft_hue_width": float(min(57.2, cluster["hue_width"] * 1.375)),
+    }
 
     hard_mask = (
+        high_sat_mask
+        &
         valid
+        & (sat >= thresholds["hard_sat_min"])
         & (value >= thresholds["hard_value_min"])
         & (hue_distance <= thresholds["hard_hue_width"])
+        & (g >= r * 1.027)
+        & (g >= b * 1.018)
+        & ((g - max_rb) >= 0.018)
     )
 
     soft_mask = (
         valid
+        & (sat >= thresholds["soft_sat_min"])
         & (value >= thresholds["soft_value_min"])
         & (hue_distance <= thresholds["soft_hue_width"])
+        & (g >= max_rb - 0.011)
     )
 
-    cleaned_hard = dilate(clean_binary_mask(hard_mask), 1)
-    return cleaned_hard, soft_mask, thresholds
+    return hard_mask, soft_mask, thresholds
 
 
 def apply_binary_alpha(alpha: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -300,7 +309,7 @@ def main() -> int:
     hue, sat, value = rgb_to_hsv(rgb)
     high_sat_mask, saturation_info = detect_saturated_pixels(hue, sat, value, alpha)
     cluster = detect_green_cluster(hue, sat, value, high_sat_mask)
-    hard_mask, soft_mask, thresholds = build_masks(rgb, hue, sat, value, alpha, cluster)
+    hard_mask, soft_mask, thresholds = build_masks(rgb, hue, sat, value, alpha, high_sat_mask, cluster)
 
     no_aa_alpha = apply_binary_alpha(alpha, hard_mask)
     save_rgba(rgb, no_aa_alpha, OUTPUT_NO_AA)
@@ -313,7 +322,8 @@ def main() -> int:
     print(
         "Detected saturated region:",
         f"sat_peak={saturation_info['sat_peak']:.2f},",
-        f"sat>={saturation_info['sat_min']:.2f}",
+        f"strict_sat>={saturation_info['strict_sat_min']:.2f},",
+        f"adjusted_sat>={saturation_info['sat_min']:.2f}",
     )
     print(
         "Refined green cluster:",
@@ -322,8 +332,9 @@ def main() -> int:
         f"value>={cluster['value_min']:.2f}",
     )
     print(
-        "Aggressive removal mask:",
+        "Adjusted removal mask:",
         f"hue+/-{thresholds['hard_hue_width']:.1f} deg,",
+        f"sat>={thresholds['hard_sat_min']:.2f},",
         f"value>={thresholds['hard_value_min']:.2f}",
     )
     print(f"Saved {OUTPUT_NO_AA}")
